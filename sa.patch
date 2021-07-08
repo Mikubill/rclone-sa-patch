@@ -1,0 +1,123 @@
+diff --git a/backend/drive/drive.go b/backend/drive/drive.go
+index 240e6a189..3d3e9151f 100755
+--- a/backend/drive/drive.go
++++ b/backend/drive/drive.go
+@@ -14,9 +14,11 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
++	"math/rand"
+ 	"mime"
+ 	"net/http"
+ 	"path"
++	"path/filepath"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -271,6 +273,9 @@ a non root folder as its starting point.
+ 		}, {
+ 			Name: "service_account_file",
+ 			Help: "Service Account Credentials JSON file path \nLeave blank normally.\nNeeded only if you want use SA instead of interactive login." + env.ShellExpandHelp,
++		}, {
++			Name: "service_account_file_path",
++			Help: "Service Account Credentials JSON file path .\n",
+ 		}, {
+ 			Name:     "service_account_credentials",
+ 			Help:     "Service Account Credentials JSON blob\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
+@@ -564,6 +569,7 @@ type Options struct {
+ 	Scope                     string               `config:"scope"`
+ 	RootFolderID              string               `config:"root_folder_id"`
+ 	ServiceAccountFile        string               `config:"service_account_file"`
++	ServiceAccountFilePath    string               `config:"service_account_file_path"`
+ 	ServiceAccountCredentials string               `config:"service_account_credentials"`
+ 	TeamDriveID               string               `config:"team_drive"`
+ 	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
+@@ -618,6 +624,9 @@ type Fs struct {
+ 	grouping         int32               // number of IDs to search at once in ListR - read with atomic
+ 	listRmu          *sync.Mutex         // protects listRempties
+ 	listRempties     map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
++
++	ServiceAccountFiles map[string]int
++	waitChangeSvc       sync.Mutex
+ }
+ 
+ type baseObject struct {
+@@ -671,6 +680,62 @@ func (f *Fs) Features() *fs.Features {
+ 	return f.features
+ }
+ 
++//
++func (f *Fs) changeSvc(ctx context.Context) error {
++	opt := &f.opt
++	if len(f.ServiceAccountFiles) <= 0 {
++		dir_list, err := ioutil.ReadDir(opt.ServiceAccountFilePath)
++		if err != nil {
++			return fmt.Errorf("read ServiceAccountFilePath error: %v", err)
++		}
++		for k, v := range dir_list {
++			fp, err := filepath.Abs(filepath.Join(opt.ServiceAccountFilePath, v.Name()))
++			if err != nil {
++				return fmt.Errorf("read ServiceAccountFilePath error: %v", err)
++			}
++			if path.Ext(fp) == ".json" {
++				f.ServiceAccountFiles[fp] = k
++			}
++		}
++		if len(f.ServiceAccountFiles) <= 0 {
++			return fmt.Errorf("no service credential file found on %s", opt.ServiceAccountFilePath)
++		}
++	}
++
++	// remove current service account
++	delete(f.ServiceAccountFiles, opt.ServiceAccountFile)
++
++	r := rand.Intn(len(f.ServiceAccountFiles))
++	for k := range f.ServiceAccountFiles {
++		if r == 0 {
++			opt.ServiceAccountFile = k
++		}
++		r--
++	}
++
++	loadedCreds, err := ioutil.ReadFile(opt.ServiceAccountFile)
++	if err != nil {
++		return fmt.Errorf("read ServiceAccountFile error: %v", err)
++	}
++
++	f.opt.ServiceAccountCredentials = string(loadedCreds)
++	oAuthClient, err := getServiceAccountClient(ctx, opt, []byte(f.opt.ServiceAccountCredentials))
++	if err != nil {
++		return fmt.Errorf("create new oauth client error: %v", err)
++	}
++
++	newSvc, err := drive.New(oAuthClient)
++	if err != nil {
++		return fmt.Errorf("create new drive service err: %v", err)
++	}
++
++	fs.Debugf("loaded new service account: %v", opt.ServiceAccountFile)
++	f.client = oAuthClient
++	f.svc = newSvc
++
++	return nil
++}
++
+ // shouldRetry determines whether a given err rates being retried
+ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
+ 	if fserrors.ContextError(ctx, &err) {
+@@ -691,6 +756,15 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
+ 		if len(gerr.Errors) > 0 {
+ 			reason := gerr.Errors[0].Reason
+ 			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
++				if f.opt.ServiceAccountFilePath != "" {
++					f.waitChangeSvc.Lock()
++					svcErr := f.changeSvc(ctx)
++					f.waitChangeSvc.Unlock()
++					if svcErr == nil {
++						return true, err
++					}
++					fs.Errorf(f, "Change service account error: %v", svcErr)
++				}
+ 				if f.opt.StopOnUploadLimit && gerr.Errors[0].Message == "User rate limit exceeded." {
+ 					fs.Errorf(f, "Received upload limit error: %v", err)
+ 					return false, fserrors.FatalError(err)
